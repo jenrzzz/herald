@@ -6,7 +6,8 @@ module Herald
   # The HTTP face (API.md is the contract). Routes check the key's
   # permission, turn the query into arguments for the Store (reads) or the
   # Sender (sends), and write every send to the audit log. What a scoped key
-  # may see is decided in Store, on every query.
+  # may see is decided in Store, on every query. /v1/keys is the exception:
+  # it takes HERALD_ADMIN_TOKEN, not a key.
   class App < Roda
     API_DOC = File.expand_path("../../API.md", __dir__)
     STATUS = {
@@ -19,6 +20,7 @@ module Herald
       "changes" => %w[since from_me limit]
     }.freeze
     SEND_FIELDS = %w[chat to text].freeze
+    KEY_FIELDS = %w[permissions scope].freeze
     MAX_TEXT = 20_000
     IDEMPOTENCY = Idempotency.new
 
@@ -56,6 +58,16 @@ module Herald
       r.get("health") { json("ok" => true, "version" => VERSION) }
 
       r.on "v1" do
+        r.on "keys" do
+          admin!
+          r.get(true) { json("keys" => Herald.keys.all.map(&:admin_json)) }
+          r.is String do |name|
+            name = unescape(name)
+            r.get { json(existing_key(name).admin_json) }
+            r.patch { change_key(name) }
+          end
+        end
+
         @key = Herald.keys.authenticate(bearer)
         raise Refusal.new("unauthorized", "send a herald key as Authorization: Bearer <key>") if @key.nil?
 
@@ -115,6 +127,48 @@ module Herald
       return true if @key.may?(permission)
 
       raise Refusal.new("forbidden", "the key #{@key.name.inspect} lacks the #{permission} permission")
+    end
+
+    # --- keys (admin) ---
+
+    # HERALD_ADMIN_TOKEN, compared in constant time. A key from keys.json is
+    # not enough, whatever it may do.
+    def admin!
+      token = Herald.admin_token
+      return if token && bearer && Rack::Utils.secure_compare(bearer, token)
+
+      raise Refusal.new("unauthorized", "keys are managed with HERALD_ADMIN_TOKEN as Authorization: Bearer <token>#{' (it is not set on this herald)' unless token}")
+    end
+
+    # The X-Admin-Actor header, for the audit log: one token, many people.
+    def admin_actor
+      request.headers["X-Admin-Actor"].to_s.strip[0, 100].then { |actor| actor.empty? ? "admin" : actor }
+    end
+
+    def existing_key(name)
+      Herald.keys.find(name) or raise Store::NotFound.new("key", "no key named #{name}")
+    end
+
+    # Permissions, scope, or both, keeping the token. Every attempt is
+    # audited, refused or not.
+    def change_key(name)
+      fields = nil
+      fields = body
+      unknown = fields.keys - KEY_FIELDS
+      raise Refusal.new("bad_request", "unknown field#{'s' if unknown.size > 1} #{unknown.join(', ')} (known: #{KEY_FIELDS.join(', ')})") if unknown.any?
+      raise Refusal.new("bad_request", "give permissions, scope, or both") if fields.empty?
+
+      changes = fields.transform_keys(&:to_sym)
+      before, after = Herald.keys.change(name, **changes)
+      Herald.audit.record(key: name, admin: admin_actor, op: "keys.change", args: fields, outcome: "changed",
+                          before: before.as_json, after: after.as_json)
+      json(after.admin_json)
+    rescue Keys::Missing => e
+      Herald.audit.record(key: name, admin: admin_actor, op: "keys.change", args: fields, outcome: "refused", error: e.message)
+      raise Store::NotFound.new("key", e.message)
+    rescue Keys::Error, Refusal => e
+      Herald.audit.record(key: name, admin: admin_actor, op: "keys.change", args: fields, outcome: "refused", error: e.message)
+      raise e.is_a?(Refusal) ? e : Refusal.new("invalid", e.message)
     end
 
     # --- sending ---

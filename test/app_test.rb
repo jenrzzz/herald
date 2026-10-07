@@ -182,4 +182,75 @@ class AppTest < Minitest::Test
     call(:post, "/v1/messages", { to: "+1 (555) 123-4567", text: "hi" }, token: @family)
     assert_equal 201, last_response.status
   end
+
+  def test_keys_take_the_admin_token_and_nothing_else
+    [ nil, "wrong", @admin ].each do |token|
+      ENV["HERALD_ADMIN_TOKEN"] = "admin-secret"
+      assert_equal [ "unauthorized", 401 ], [ call(:get, "/v1/keys", token: token).dig("error", "code"), last_response.status ]
+      call(:patch, "/v1/keys/family", { permissions: %w[read] }, token: token)
+      assert_equal 401, last_response.status
+    end
+    ENV.delete("HERALD_ADMIN_TOKEN")
+    assert_match(/not set/, call(:get, "/v1/keys", token: "").dig("error", "message"))
+    assert_equal %w[read send], Herald.keys.find("family").permissions
+    assert_empty audit
+  ensure
+    ENV.delete("HERALD_ADMIN_TOKEN")
+  end
+
+  def test_an_admin_reads_and_changes_a_key_without_rotating_it
+    ENV["HERALD_ADMIN_TOKEN"] = "admin-secret"
+    keys = call(:get, "/v1/keys", token: "admin-secret")["keys"]
+    assert_equal %w[hob reader family], keys.map { |k| k["name"] }
+    refute keys.any? { |k| k.key?("digest") }, "the digest never leaves"
+    assert_equal({ "chats" => [ "any;+;chat100" ], "handles" => [ "+15551234567" ] }, call(:get, "/v1/keys/family", token: "admin-secret")["scope"])
+    missing = call(:get, "/v1/keys/nope", token: "admin-secret")
+    assert_equal [ 404, "key" ], [ last_response.status, missing.dig("error", "kind") ]
+
+    changed = call(:patch, "/v1/keys/family", { permissions: %w[read], scope: { chats: [ "any;+;chat100" ] } },
+                   token: "admin-secret", headers: { "HTTP_X_ADMIN_ACTOR" => "jenner" })
+    assert_equal 200, last_response.status
+    assert_equal [ %w[read], { "chats" => [ "any;+;chat100" ] } ], changed.values_at("permissions", "scope")
+    refute_nil changed["updated_at"]
+
+    assert_equal "family", Herald.keys.authenticate(@family).name, "the token still works"
+    call(:post, "/v1/messages", { chat: "any;+;chat100", text: "hi" }, token: @family)
+    assert_equal 403, last_response.status, "and it may no longer send"
+    assert_equal [ "any;+;chat100" ], call(:get, "/v1/chats", token: @family)["chats"].map { |c| c["id"] }
+
+    entry = audit.last
+    assert_equal [ "keys.change", "family", "jenner", "changed" ], entry.values_at("op", "key", "admin", "outcome")
+    assert_equal %w[read send], entry.dig("before", "permissions")
+    assert_equal %w[read], entry.dig("after", "permissions")
+
+    call(:patch, "/v1/keys/family", { scope: nil }, token: "admin-secret")
+    assert_equal [ 200, nil, %w[read] ], [ last_response.status, Herald.keys.find("family").scope, Herald.keys.find("family").permissions ]
+  ensure
+    ENV.delete("HERALD_ADMIN_TOKEN")
+  end
+
+  def test_a_refused_key_change_changes_nothing_and_is_audited
+    ENV["HERALD_ADMIN_TOKEN"] = "admin-secret"
+    [
+      [ { permissions: %w[write] }, 422 ],
+      [ { permissions: [] }, 422 ],
+      [ { permissions: "read" }, 422 ],
+      [ { scope: { chats: [] } }, 422 ],
+      [ { scope: { handles: [ 7 ] } }, 422 ],
+      [ { domains: [ "x" ] }, 400 ],
+      [ {}, 400 ],
+      [ "{", 400 ]
+    ].each do |payload, status|
+      call(:patch, "/v1/keys/family", payload, token: "admin-secret")
+      assert_equal status, last_response.status, payload.inspect
+    end
+    call(:patch, "/v1/keys/nope", { permissions: %w[read] }, token: "admin-secret")
+    assert_equal 404, last_response.status
+
+    family = Herald.keys.find("family")
+    assert_equal [ %w[read send], [ "any;+;chat100" ] ], [ family.permissions, family.scope["chats"] ]
+    assert_equal [ "refused" ] * 9, audit.map { |entry| entry["outcome"] }
+  ensure
+    ENV.delete("HERALD_ADMIN_TOKEN")
+  end
 end

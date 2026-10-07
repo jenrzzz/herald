@@ -96,7 +96,8 @@ authorization.
 | `HERALD_HOME` | `~/.config/herald` | where `keys.json` lives (digests only, mode 600) |
 | `HERALD_DATABASE` | `~/Library/Messages/chat.db` | the Messages database |
 | `HERALD_CONTACTS` | `~/Library/Application Support/AddressBook` | where Contacts keeps its databases |
-| `HERALD_AUDIT_LOG` | `~/Library/Logs/herald/audit.jsonl` | one line per send: when, key, to whom, its length (never its text), outcome |
+| `HERALD_AUDIT_LOG` | `~/Library/Logs/herald/audit.jsonl` | one line per send (when, key, to whom, its length, never its text, outcome) and per key change |
+| `HERALD_ADMIN_TOKEN` | unset | bearer token for `/v1/keys` (below); unset means those endpoints always answer `401`. `herald install` takes it from the environment, or from `$HERALD_HOME/admin.token` |
 | `HERALD_TIMEOUT` | `30` | seconds to wait for Messages to take a send before answering 503 |
 | `HERALD_SEND_WAIT` | `10` | seconds to watch for a sent message to appear before answering 202 |
 | `HERALD_APP` | `~/Applications/Herald.app` | where `bin/herald app` builds the bundle the agent starts from |
@@ -126,6 +127,17 @@ the household's behalf.
 
 `send` is separate from `read` because a sent message cannot be taken
 back. Most keys should not have it.
+
+To change a key's permissions or scope without rotating its token, so
+whatever already uses it keeps working, use `PATCH /v1/keys/:name` instead
+of `key add` (which always rotates). It takes `HERALD_ADMIN_TOKEN`, not a
+key; see [API.md](API.md#keys-admin).
+
+```sh
+(umask 077; openssl rand -base64 24 > ~/.config/herald/admin.token)
+HERALD_BIND=127.0.0.1,100.90.105.100 bin/herald install   # puts it in the launchd agent's environment
+curl -H "Authorization: Bearer $(cat ~/.config/herald/admin.token)" http://127.0.0.1:8379/v1/keys
+```
 
 ## How it works
 

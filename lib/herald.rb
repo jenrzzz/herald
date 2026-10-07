@@ -39,6 +39,12 @@ module Herald
     @audit ||= Audit.new(ENV.fetch("HERALD_AUDIT_LOG", File.expand_path("~/Library/Logs/herald/audit.jsonl")))
   end
 
+  # The household admin's credential for /v1/keys, separate from every key
+  # in keys.json and never stored there. Unset, those endpoints refuse.
+  def admin_token
+    ENV["HERALD_ADMIN_TOKEN"].to_s.strip.then { |token| token.empty? ? nil : token }
+  end
+
   # How long a send waits for its message to appear in the database.
   def send_wait
     Float(ENV.fetch("HERALD_SEND_WAIT", "10"))

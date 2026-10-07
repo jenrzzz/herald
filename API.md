@@ -194,6 +194,51 @@ other chat it cannot see, and a `to` outside it is `403`. Phone numbers match ho
 they are written (`+1 (555) 123-4567`, `5551234567`); addresses match in
 any case.
 
+## Keys (admin)
+
+```
+GET   /v1/keys                    → { "keys": [key] }
+GET   /v1/keys/:name              → key
+PATCH /v1/keys/:name              → key
+  { "permissions": ["read"],                              replaces the key's permissions
+    "scope": { "chats": ["any;+;chat8273..."], "handles": ["+15551234567"] } }
+                                  replaces its scope; null sees every chat
+key: { "name", "permissions", "scope", "created_at", "updated_at" }
+```
+
+Reads and changes keys without rotating their tokens: whatever already
+uses a key goes on working, with what it may now do and see. This is a
+household-admin operation, not an agent's: it takes
+`Authorization: Bearer <HERALD_ADMIN_TOKEN>`, a credential set in the
+server's environment, separate from every key and never stored in
+`keys.json`. No key works here, whatever it may do; with no
+`HERALD_ADMIN_TOKEN` set, these answer `401` to everyone. Tokens and their
+digests never come back.
+
+A `PATCH` gives `permissions`, `scope`, or both; one left out is kept.
+`scope` replaces the whole scope, not one list of it, and a scope that
+names no chats and no handles is refused: confining a key to nothing and
+opening it to everything look too much alike, so the second is said with
+`"scope": null`. An optional `X-Admin-Actor: <name>` header is written to
+the audit log with the change; without it the log says `"admin"`. Every
+`PATCH`, accepted or refused, is audited (`op: "keys.change"`), with the
+key before and after.
+
+```sh
+curl -X PATCH -H "Authorization: Bearer $(cat ~/.config/herald/admin.token)" \
+     -H "content-type: application/json" \
+     -d '{"permissions":["read"],"scope":{"chats":["any;+;chat8273..."]}}' \
+     http://127.0.0.1:8379/v1/keys/hob-household
+```
+
+| status | means |
+|---|---|
+| `200 key` | the key as it is now |
+| `400 bad_request` | not a JSON object, an unknown field, or neither field |
+| `401 unauthorized` | no `HERALD_ADMIN_TOKEN` on this herald, or the bearer did not match it |
+| `404 not_found`, `kind: "key"` | no key by that name |
+| `422 invalid` | an unknown permission, no permissions, a scope that is not chats and handles, a handle that is not a phone number or address, or an empty scope |
+
 ## Status
 
 ### GET /v1/status

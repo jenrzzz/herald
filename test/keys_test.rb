@@ -53,4 +53,19 @@ class KeysTest < Minitest::Test
     refute @keys.revoke("hob")
     assert_nil @keys.authenticate(token)
   end
+
+  def test_changing_a_key_keeps_its_token
+    token = @keys.add("family", permissions: %w[read send], scope: { chats: [ "any;+;chat100" ] })
+    before, after = @keys.change("family", permissions: %w[read])
+    assert_equal [ %w[read send], %w[read] ], [ before.permissions, after.permissions ]
+    assert_equal({ "chats" => [ "any;+;chat100" ] }, after.scope, "a scope left out is kept")
+    assert_equal "family", @keys.authenticate(token).name
+    refute @keys.authenticate(token).may?(:send)
+
+    _, after = @keys.change("family", scope: nil)
+    assert_nil after.scope
+    assert_raises(Herald::Keys::Missing) { @keys.change("nope", permissions: %w[read]) }
+    error = assert_raises(Herald::Keys::Error) { @keys.change("family", scope: { chats: [ " " ] }) }
+    assert_match(/every chat/, error.message)
+  end
 end

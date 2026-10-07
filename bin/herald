@@ -94,6 +94,12 @@ def install
   logs = File.expand_path("~/Library/Logs/herald")
   environment = { "HERALD_BIND" => ENV.fetch("HERALD_BIND", "127.0.0.1"), "HERALD_PORT" => ENV.fetch("HERALD_PORT", "8379"),
                   "RACK_ENV" => "production", "LANG" => "en_US.UTF-8" }
+  # The admin token from the environment, or else the one kept beside the
+  # keys; without it /v1/keys answers 401 to everyone.
+  admin_token_path = File.join(Herald.home, "admin.token")
+  admin_token = Herald.admin_token || (File.exist?(admin_token_path) ? File.read(admin_token_path).strip : "")
+  environment["HERALD_ADMIN_TOKEN"] = admin_token unless admin_token.empty?
+  dry_run = ARGV.include?("--dry-run")
   plist = <<~XML
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -108,7 +114,7 @@ def install
     #{"  <key>AssociatedBundleIdentifiers</key><string>#{Herald::Wrapper::BUNDLE_ID}</string>" if wrapper}
       <key>EnvironmentVariables</key>
       <dict>
-    #{environment.map { |name, value| "    <key>#{name}</key><string>#{value}</string>" }.join("\n")}
+    #{environment.map { |name, value| "    <key>#{name}</key><string>#{name == 'HERALD_ADMIN_TOKEN' && dry_run ? '(redacted)' : value.encode(xml: :text)}</string>" }.join("\n")}
       </dict>
       <key>RunAtLoad</key><true/>
       <key>KeepAlive</key><true/>
@@ -118,11 +124,13 @@ def install
     </dict>
     </plist>
   XML
-  return puts(plist) if ARGV.include?("--dry-run")
+  return puts(plist) if dry_run
 
   FileUtils.mkdir_p(logs)
   FileUtils.mkdir_p(File.dirname(PLIST))
-  File.write(PLIST, plist)
+  # Mode 600: the plist can hold the admin token.
+  File.write(PLIST, plist, perm: 0o600)
+  File.chmod(0o600, PLIST)
   domain = "gui/#{Process.uid}"
   system("launchctl", "bootout", "#{domain}/#{LABEL}", err: File::NULL, out: File::NULL)
   # bootout answers before launchd has let go of the label, and a bootstrap
@@ -133,7 +141,8 @@ def install
   end
   abort "herald: launchctl could not load #{PLIST}; herald is NOT running (launchctl bootstrap #{domain} #{PLIST})" unless loaded
   puts "herald is running on #{environment['HERALD_BIND']} port #{environment['HERALD_PORT']} and will start at login."
-  puts "logs: #{logs}/server.log · sends: #{logs}/audit.jsonl"
+  puts "logs: #{logs}/server.log · sends and key changes: #{logs}/audit.jsonl"
+  puts admin_token.empty? ? "/v1/keys: off (no HERALD_ADMIN_TOKEN, no #{admin_token_path})" : "/v1/keys: on (HERALD_ADMIN_TOKEN)"
   app_name = wrapper ? "Herald.app (#{wrapper.app})" : "ruby"
   puts "Give #{app_name} Full Disk Access (System Settings → Privacy & Security), or every read is a 503 that says so."
   puts "The first send makes macOS ask whether #{wrapper ? 'Herald' : 'ruby'} may control Messages: answer it on this Mac's screen."

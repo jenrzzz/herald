@@ -26,7 +26,7 @@ module Herald
       end
     end
 
-    Key = Struct.new(:name, :permissions, :scope, :created_at, keyword_init: true) do
+    Key = Struct.new(:name, :permissions, :scope, :created_at, :updated_at, keyword_init: true) do
       def may?(permission)
         permissions.include?(permission.to_s)
       end
@@ -39,9 +39,14 @@ module Herald
       def as_json
         { "name" => name, "permissions" => permissions, "scope" => scope }
       end
+
+      def admin_json
+        as_json.merge("created_at" => created_at, "updated_at" => updated_at)
+      end
     end
 
     class Error < StandardError; end
+    class Missing < Error; end
 
     attr_reader :path
 
@@ -68,11 +73,7 @@ module Herald
     def add(name, permissions: %w[read], scope: nil)
       raise Error, "a key needs a name of letters, digits, dots, dashes or underscores" unless name.to_s.match?(/\A[a-zA-Z0-9][a-zA-Z0-9._-]*\z/)
 
-      permissions = permissions.map(&:to_s).uniq
-      unknown = permissions - PERMISSIONS
-      raise Error, "unknown permission #{unknown.join(', ')}; there are #{PERMISSIONS.join(', ')}" if unknown.any?
-      raise Error, "a key needs at least one permission" if permissions.empty?
-
+      permissions = clean_permissions(permissions)
       scope = clean_scope(scope)
       token = PREFIX + SecureRandom.urlsafe_base64(32)
       update do |list|
@@ -83,6 +84,35 @@ module Herald
       token
     end
 
+    def find(name)
+      row = rows.find { |candidate| candidate["name"] == name }
+      row && key(row)
+    end
+
+    # Changes a key's permissions, its scope, or both, keeping its token:
+    # whatever already uses the key goes on working. A nil scope sees every
+    # chat; leave a keyword out to keep what the key has. Returns the key
+    # before and after.
+    def change(name, permissions: :keep, scope: :keep)
+      permissions = clean_permissions(permissions) unless permissions == :keep
+      unless scope == :keep
+        widened = !scope.nil? && clean_scope(scope).nil?
+        raise Error, "a scope with no chats and no handles would see every chat; to mean that, send a null scope" if widened
+
+        scope = clean_scope(scope)
+      end
+      before = after = nil
+      update do |list|
+        row = list.find { |candidate| candidate["name"] == name } or raise Missing, "no key named #{name}"
+        before = key(row)
+        row["permissions"] = permissions unless permissions == :keep
+        row["scope"] = scope unless scope == :keep
+        row["updated_at"] = Time.now.utc.iso8601
+        after = key(row)
+      end
+      [ before, after ]
+    end
+
     def revoke(name)
       removed = false
       update { |list| removed = !list.reject! { |row| row["name"] == name }.nil? }
@@ -91,8 +121,20 @@ module Herald
 
     private
 
+    def clean_permissions(permissions)
+      raise Error, "permissions is a list: #{PERMISSIONS.join(', ')}" unless permissions.is_a?(Array)
+
+      permissions = permissions.map(&:to_s).uniq
+      unknown = permissions - PERMISSIONS
+      raise Error, "unknown permission #{unknown.join(', ')}; there are #{PERMISSIONS.join(', ')}" if unknown.any?
+      raise Error, "a key needs at least one permission" if permissions.empty?
+
+      permissions
+    end
+
     def clean_scope(scope)
       return nil if scope.nil?
+      raise Error, "a scope is an object of chats and handles, or null for every chat" unless scope.is_a?(Hash)
 
       scope = scope.transform_keys(&:to_s)
       unknown = scope.keys - SCOPE_KEYS
@@ -100,7 +142,10 @@ module Herald
 
       cleaned = {}
       SCOPE_KEYS.each do |kind|
-        values = Array(scope[kind]).map { |value| value.to_s.strip }.reject(&:empty?).uniq
+        values = scope[kind]
+        raise Error, "scope #{kind} is a list of strings" unless values.nil? || (values.is_a?(Array) && values.all?(String))
+
+        values = Array(values).map(&:strip).reject(&:empty?).uniq
         cleaned[kind] = values if values.any?
       end
       bad = Array(cleaned["handles"]).select { |handle| Handles.key(handle).nil? }
@@ -110,7 +155,8 @@ module Herald
     end
 
     def key(row)
-      Key.new(name: row["name"], permissions: row["permissions"] || [], scope: row["scope"], created_at: row["created_at"])
+      Key.new(name: row["name"], permissions: row["permissions"] || [], scope: row["scope"], created_at: row["created_at"],
+              updated_at: row["updated_at"])
     end
 
     def rows
