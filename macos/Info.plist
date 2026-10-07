@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>place.amber.herald</string>
+  <key>CFBundleName</key><string>Herald</string>
+  <key>CFBundleDisplayName</key><string>Herald</string>
+  <key>CFBundleExecutable</key><string>herald</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSBackgroundOnly</key><true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>herald sends iMessages and texts from this Mac on behalf of the agents you have given a herald key.</string>
+</dict>
+</plist>

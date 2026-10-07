@@ -1,0 +1,170 @@
+#!/usr/bin/env ruby
+# herald serve                      run the server (HERALD_BIND, HERALD_PORT)
+# herald key add NAME [options]     make or rotate a key; the token prints once
+# herald key list | revoke NAME
+# herald check                      read the Messages database and Contacts, as the server would
+# herald chats [WORDS]              recent chats and their ids, to scope a key by
+# herald install [--dry-run] [--no-app]   the launchd agent that keeps the server running
+# herald uninstall
+# herald app                        build and sign Herald.app, which the agent starts ruby from
+require "fileutils"
+require "optparse"
+ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
+require "bundler/setup"
+require_relative "../lib/herald"
+
+ROOT = File.expand_path("..", __dir__)
+LABEL = "place.amber.herald".freeze
+PLIST = File.expand_path("~/Library/LaunchAgents/#{LABEL}.plist")
+
+def usage
+  puts File.readlines(__FILE__).drop(1).take_while { |line| line.start_with?("#") }.map { |line| line.sub(/\A# ?/, "") }
+  exit 1
+end
+
+def key_add(arguments)
+  permissions = %w[read]
+  scope = { "chats" => [], "handles" => [] }
+  OptionParser.new do |options|
+    options.banner = "herald key add NAME [options]"
+    options.on("--permissions LIST", "read,send (default read)") { |list| permissions = list.split(",").map(&:strip) }
+    options.on("--chat ID", "confine the key to a chat, by id or identifier (repeatable; herald chats lists them)") { |id| scope["chats"] << id }
+    options.on("--handle HANDLE", "confine the key to a person: their one-to-one chats, and sending to them (repeatable)") { |handle| scope["handles"] << handle }
+  end.parse!(arguments)
+  name = arguments.shift or abort "herald key add needs a name"
+  scoped = scope.values.any?(&:any?)
+
+  token = Herald.keys.add(name, permissions: permissions, scope: scoped ? scope : nil)
+  puts "key #{name}: #{permissions.join(', ')}#{scoped ? ", scoped to #{scope.reject { |_, v| v.empty? }}" : ''}"
+  puts "  #{token}"
+  puts "shown once; herald keeps only a digest (#{Herald.keys.path})"
+rescue Herald::Keys::Error, OptionParser::ParseError => e
+  abort "herald: #{e.message}"
+end
+
+def key_list
+  keys = Herald.keys.all
+  puts "no keys yet: bin/herald key add NAME --permissions read,send" if keys.empty?
+  keys.each do |key|
+    puts format("%-24s %-12s %s", key.name, key.permissions.join(","), key.scope ? key.scope.to_json : "every chat")
+  end
+end
+
+def check
+  status = Herald.store.status
+  puts "Messages: #{status['messages']} messages in #{status['chats']} chats, the latest at #{status['latest_at'] || 'never'}"
+  people = Herald.contacts.count
+  puts people ? "Contacts: #{people} people" : "Contacts: unreadable (names will be null)"
+rescue Herald::Store::Unavailable => e
+  abort "herald: #{e.message}"
+end
+
+def chats(arguments)
+  Herald.store.chats(q: arguments.join(" ").then { |q| q.empty? ? nil : q }, limit: 30).each do |chat|
+    puts format("%-40s %-8s %s", chat["id"], chat["service"], chat["name"])
+  end
+rescue Herald::Store::Unavailable => e
+  abort "herald: #{e.message}"
+end
+
+# Herald.app (Herald::Wrapper): what macOS is asked to trust instead of ruby.
+def app
+  wrapper = Herald::Wrapper.new
+  requirement = wrapper.build
+  puts "built and signed #{wrapper.app}"
+  puts "macOS will remember Full Disk Access and its permission to control Messages against: #{requirement}"
+  puts "bin/herald install points the launchd agent at it."
+rescue Herald::Wrapper::Error => e
+  abort "herald: #{e.message}"
+end
+
+# A LaunchAgent, not a daemon: it has to live in the login session to be
+# allowed to talk to the Messages app. It starts Herald.app's launcher, and
+# the launcher starts ruby, so the app is what macOS asks about and a new
+# ruby is only a new path in this plist (--no-app starts ruby bare).
+def install
+  ruby = `cd #{ROOT} && asdf which ruby 2>/dev/null`.strip
+  ruby = RbConfig.ruby if ruby.empty?
+  program = [ ruby, "#{ROOT}/bin/herald", "serve" ]
+  wrapper = ARGV.include?("--no-app") ? nil : Herald::Wrapper.new
+  if wrapper
+    wrapper.build unless wrapper.built? || ARGV.include?("--dry-run")
+    program.unshift(wrapper.launcher)
+  end
+  logs = File.expand_path("~/Library/Logs/herald")
+  environment = { "HERALD_BIND" => ENV.fetch("HERALD_BIND", "127.0.0.1"), "HERALD_PORT" => ENV.fetch("HERALD_PORT", "8379"),
+                  "RACK_ENV" => "production", "LANG" => "en_US.UTF-8" }
+  plist = <<~XML
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key><string>#{LABEL}</string>
+      <key>WorkingDirectory</key><string>#{ROOT}</string>
+      <key>ProgramArguments</key>
+      <array>
+    #{program.map { |argument| "    <string>#{argument}</string>" }.join("\n")}
+      </array>
+    #{"  <key>AssociatedBundleIdentifiers</key><string>#{Herald::Wrapper::BUNDLE_ID}</string>" if wrapper}
+      <key>EnvironmentVariables</key>
+      <dict>
+    #{environment.map { |name, value| "    <key>#{name}</key><string>#{value}</string>" }.join("\n")}
+      </dict>
+      <key>RunAtLoad</key><true/>
+      <key>KeepAlive</key><true/>
+      <key>ProcessType</key><string>Interactive</string>
+      <key>StandardOutPath</key><string>#{logs}/server.log</string>
+      <key>StandardErrorPath</key><string>#{logs}/server.log</string>
+    </dict>
+    </plist>
+  XML
+  return puts(plist) if ARGV.include?("--dry-run")
+
+  FileUtils.mkdir_p(logs)
+  FileUtils.mkdir_p(File.dirname(PLIST))
+  File.write(PLIST, plist)
+  domain = "gui/#{Process.uid}"
+  system("launchctl", "bootout", "#{domain}/#{LABEL}", err: File::NULL, out: File::NULL)
+  # bootout answers before launchd has let go of the label, and a bootstrap
+  # that arrives too soon fails ("5: Input/output error") with herald down.
+  loaded = 10.times.any? do |attempt|
+    sleep(0.5 * attempt)
+    system("launchctl", "bootstrap", domain, PLIST, err: File::NULL)
+  end
+  abort "herald: launchctl could not load #{PLIST}; herald is NOT running (launchctl bootstrap #{domain} #{PLIST})" unless loaded
+  puts "herald is running on #{environment['HERALD_BIND']} port #{environment['HERALD_PORT']} and will start at login."
+  puts "logs: #{logs}/server.log · sends: #{logs}/audit.jsonl"
+  app_name = wrapper ? "Herald.app (#{wrapper.app})" : "ruby"
+  puts "Give #{app_name} Full Disk Access (System Settings → Privacy & Security), or every read is a 503 that says so."
+  puts "The first send makes macOS ask whether #{wrapper ? 'Herald' : 'ruby'} may control Messages: answer it on this Mac's screen."
+rescue Herald::Wrapper::Error => e
+  abort "herald: #{e.message}"
+end
+
+def uninstall
+  system("launchctl", "bootout", "gui/#{Process.uid}/#{LABEL}", err: File::NULL, out: File::NULL)
+  File.delete(PLIST) if File.exist?(PLIST)
+  puts "herald's launchd agent is gone; keys and logs are untouched."
+end
+
+case ARGV.shift
+when "serve"
+  Dir.chdir(ROOT)
+  require "puma/cli"
+  Puma::CLI.new([ "--config", File.join(ROOT, "config/puma.rb"), File.join(ROOT, "config.ru") ]).run
+when "key"
+  case ARGV.shift
+  when "add" then key_add(ARGV)
+  when "list" then key_list
+  when "revoke"
+    name = ARGV.shift or abort "herald key revoke needs a name"
+    puts Herald.keys.revoke(name) ? "revoked #{name}" : "no key named #{name}"
+  else usage
+  end
+when "check" then check
+when "chats" then chats(ARGV)
+when "install" then install
+when "app" then app
+when "uninstall" then uninstall
+else usage
+end
